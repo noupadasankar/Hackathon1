@@ -4,8 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "run_privfd_sample.py"
-      - ".github/workflows/privfd_sample.yml"
+      - "experiment-trigger.txt"
   workflow_dispatch:
 
 permissions:
