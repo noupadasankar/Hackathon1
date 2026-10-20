@@ -722,3 +722,5 @@ def main():
 
 if __name__=="__main__":
     main()
+
+# Artifact packaging trigger; the validated run source is pinned separately in export_runner.yml.
