@@ -676,7 +676,7 @@ def main():
                 acc=rdp.RdpAccountant()
                 if steps>0:
                     acc.compose(dp_event.PoissonSampledDpEvent(q,dp_event.GaussianDpEvent(sigma)),count=steps)
-                    eps_ind=float(acc.get_epsilon(delta=delta))
+                    eps_ind=float(acc.get_epsilon(delta))
                 else: eps_ind=0.0
                 independent_rows.append({"seed":int(seed_i),"model":model_i,"scenario":scenario_i,"client":client_i,
                     "round":int(rr["round"]),"sample_rate_actual":q,"noise_multiplier":sigma,
