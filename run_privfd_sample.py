@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Reproducible PrivFD-IDS sampled N-BaIoT experiment.
+"""Reproducible PrivFD-IDS experiment on a sampled set of raw captures from the official UCI N-BaIoT archive.
 
-Data: pinned community-prepared N-BaIoT sample mirror; not the full UCI archive.
-No scores are hard-coded. All metrics and figures are created from executed runs.
+The complete official archive is downloaded, SHA-256 recorded, and source capture files audited; model fitting uses a deterministic bounded sample rather than all 7,062,606 records. No scores are hard-coded; metrics and figures come from executed runs.
 """
 from __future__ import annotations
-import io, os, re, json, time, hashlib, random, platform, sys, warnings
+import io, os, re, json, time, hashlib, random, platform, sys, warnings, zipfile, subprocess, secrets, math, shutil
 from pathlib import Path
 from copy import deepcopy
 
@@ -27,25 +26,34 @@ from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
 from opacus import PrivacyEngine
 
-REPO = "huylq/N-BaIoT-Sample"
-DATA_COMMIT = "c06df3ace3c11fa88ad085185311bf9f797a8626"
-API_URL = f"https://api.github.com/repos/{REPO}/contents/data/dataset20000?ref={DATA_COMMIT}"
+OFFICIAL_DATA_URL = "https://archive.ics.uci.edu/static/public/442/detection+of+iot+botnet+attacks+n+baiot.zip"
+DATASET_DOI = "10.24432/C5RC8J"
+DATASET_PAGE = "https://archive.ics.uci.edu/dataset/442/detection"
 ROOT = Path("privfd_outputs")
 FIG = ROOT / "figures"
-CACHE = Path("data_cache/nbaiot_sample")
-ROOT.mkdir(exist_ok=True, parents=True); FIG.mkdir(exist_ok=True, parents=True); CACHE.mkdir(exist_ok=True, parents=True)
+CACHE = Path("data_cache/official_nbaiot")
+ARCHIVE_PATH = CACHE / "n_baiot_official.zip"
+RAW_ROOT = CACHE / "extracted"
+ROOT.mkdir(exist_ok=True, parents=True); FIG.mkdir(parents=True, exist_ok=True); CACHE.mkdir(parents=True, exist_ok=True)
 SEEDS = [0, 1, 2, 3, 4]
 ROUNDS = 5
 BATCH_SIZE = 256
 LOCAL_EPOCHS = 1
 LR = 0.025
 TOP_K = 50
-MAX_PER_ATTACK_CAPTURE = 250
-ROWS_PER_CLASS_CLIENT = 1000
+BENIGN_CAPTURE_CAP = 10000
+ATTACK_CAPTURE_CAP = 2000
+CAPTURE_EMBARGO_SAMPLED_ROWS = 5
 DELTA_DP = 1e-5
 CLIP_NORM = 1.0
 NOISES = [0.7, 1.0, 1.5]
-MALICIOUS_CLIENTS_BY_SEED = {}  # filled after client names are known
+DEVICE_NAMES = [
+    "Danmini_Doorbell", "Ecobee_Thermostat", "Ennio_Doorbell",
+    "Philips_B120N10_Baby_Monitor", "Provision_PT_737E_Security_Camera",
+    "Provision_PT_838_Security_Camera", "Samsung_SNH_1011_N_Webcam",
+    "SimpleHome_XCS7_1002_WHT_Security_Camera",
+    "SimpleHome_XCS7_1003_WHT_Security_Camera",
+]
 torch.set_num_threads(1)
 DEVICE = torch.device("cpu")
 
@@ -53,132 +61,226 @@ def seed_all(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-def parse_name(name):
-    m = re.match(r"^(.+?)_(\d+)sample_(.+)\.csv$", name)
-    if not m: return None
-    return m.group(1), m.group(2), m.group(3).lower()
+def _sha256_file(path, chunk_size=8 * 1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-def get_dataset_listing():
-    r = requests.get(API_URL, timeout=60)
-    r.raise_for_status()
-    items = r.json()
-    return [x for x in items if x.get("type") == "file" and x.get("name","").endswith(".csv") and parse_name(x["name"])]
+def prepare_official_dataset():
+    CACHE.mkdir(parents=True, exist_ok=True); RAW_ROOT.mkdir(parents=True, exist_ok=True)
+    if not ARCHIVE_PATH.exists() or ARCHIVE_PATH.stat().st_size < 1_000_000_000:
+        tmp = ARCHIVE_PATH.with_suffix(".zip.part")
+        if tmp.exists(): tmp.unlink()
+        print("Downloading the official UCI N-BaIoT archive (large file)...")
+        h = hashlib.sha256()
+        with requests.get(OFFICIAL_DATA_URL, stream=True, timeout=(60, 300)) as response:
+            response.raise_for_status()
+            with open(tmp, "wb") as dst:
+                for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        dst.write(chunk); h.update(chunk)
+        if tmp.stat().st_size < 1_000_000_000:
+            raise RuntimeError(f"Official UCI ZIP unexpectedly small: {tmp.stat().st_size} bytes")
+        tmp.replace(ARCHIVE_PATH); archive_sha = h.hexdigest()
+    else:
+        archive_sha = _sha256_file(ARCHIVE_PATH)
+    (CACHE / "n_baiot_official.sha256").write_text(f"{archive_sha}  {ARCHIVE_PATH.name}\n", encoding="utf-8")
+    sentinel = RAW_ROOT / ".uci_zip_extracted"
+    if not sentinel.exists():
+        print(f"Extracting official UCI ZIP ({ARCHIVE_PATH.stat().st_size:,} bytes)...")
+        with zipfile.ZipFile(ARCHIVE_PATH) as zf:
+            # Zip extraction verifies CRC while extracting; a separate full testzip scan is unnecessary.
+            zf.extractall(RAW_ROOT)
+        sentinel.write_text("completed\n", encoding="utf-8")
+    rar_files = sorted(RAW_ROOT.rglob("*.rar"))
+    if not rar_files:
+        raise RuntimeError("No attack RAR archives found in the official UCI ZIP")
+    seven_zip = shutil.which("7zz") or shutil.which("7z")
+    if seven_zip is None:
+        raise RuntimeError("7-Zip CLI missing; workflow must install package '7zip'")
+    for rar in rar_files:
+        out_dir = rar.parent / (rar.stem + "_extracted")
+        if out_dir.exists() and any(out_dir.rglob("*.csv")):
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Extracting attack archive {rar.relative_to(RAW_ROOT)}")
+        proc = subprocess.run([seven_zip, "x", str(rar), f"-o{out_dir}", "-y", "-bso0", "-bsp0"],
+                              text=True, capture_output=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"7-Zip failed on {rar}: {proc.stderr[-2500:]}")
+    csv_files=[]
+    for path in sorted(RAW_ROOT.rglob("*.csv")):
+        if any(x in path.name.lower() for x in ["readme","metadata","description"]):
+            continue
+        if not any(dev in str(path) for dev in DEVICE_NAMES):
+            continue
+        try:
+            if len(pd.read_csv(path,nrows=0).columns)==115:
+                csv_files.append(path)
+        except Exception as exc:
+            print(f"Skipping unreadable CSV {path}: {exc}")
+    if len(csv_files) < 50:
+        raise RuntimeError(f"Too few official 115-feature capture CSVs: {len(csv_files)}")
+    return csv_files, archive_sha
 
-def read_capture(item, seed):
-    path = CACHE / item["name"]
-    if not path.exists() or path.stat().st_size != int(item.get("size", -1)):
-        url = f"https://raw.githubusercontent.com/{REPO}/{DATA_COMMIT}/{item['path']}"
-        r = requests.get(url, timeout=120)
-        r.raise_for_status()
-        content = r.content
-        if len(content) != int(item["size"]):
-            raise RuntimeError(f"Size mismatch for {item['name']}: expected {item['size']} got {len(content)}")
-        path.write_bytes(content)
-    df = pd.read_csv(path)
-    df = df.apply(pd.to_numeric, errors="coerce")
-    df = df.replace([np.inf, -np.inf], np.nan)
-    # Keep columns containing at least one finite numeric value; the dataset should have 115 features.
-    df = df.dropna(axis=1, how="all")
-    if len(df.columns) != 115:
-        raise RuntimeError(f"{item['name']} yielded {len(df.columns)} features, expected 115")
-    df = df.fillna(df.median(numeric_only=True)).fillna(0.0)
-    arr = df.to_numpy(dtype=np.float32)
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-    _, n, capture = parse_name(item["name"])
-    label = 0 if capture == "benign" else 1
-    cap = min(len(arr), MAX_PER_ATTACK_CAPTURE if label == 1 else ROWS_PER_CLASS_CLIENT)
-    rng = np.random.default_rng(seed)
-    if len(arr) > cap:
-        idx = rng.choice(len(arr), size=cap, replace=False)
-        arr = arr[np.sort(idx)]
-    return arr, label
+def _device_name(path):
+    matches=[device for device in DEVICE_NAMES if device in str(path)]
+    if len(matches)!=1:
+        raise RuntimeError(f"Could not determine device from {path}: {matches}")
+    return matches[0]
+
+def _count_csv_data_rows(path):
+    with open(path,"r",encoding="utf-8",errors="replace",newline="") as fh:
+        return max(0,sum(1 for _ in fh)-1)
+
+def _systematic_capture_sample(path, cap):
+    total_rows=_count_csv_data_rows(path)
+    if total_rows < 100:
+        raise RuntimeError(f"Too few rows in official capture {path}: {total_rows}")
+    n_take=min(int(cap),int(total_rows))
+    target_idx=np.linspace(0,total_rows-1,n_take,dtype=np.int64)
+    samples=[]; offsets=[]; start=0
+    for chunk in pd.read_csv(path,chunksize=100000):
+        end=start+len(chunk)
+        lo=np.searchsorted(target_idx,start,side="left")
+        hi=np.searchsorted(target_idx,end,side="left")
+        if hi>lo:
+            local=target_idx[lo:hi]-start
+            part=chunk.iloc[local].apply(pd.to_numeric,errors="coerce").replace([np.inf,-np.inf],np.nan)
+            if part.shape[1]!=115:
+                raise RuntimeError(f"{path} yielded {part.shape[1]} features, expected 115")
+            part=part.fillna(part.median(numeric_only=True)).fillna(0.0)
+            arr=np.nan_to_num(part.to_numpy(dtype=np.float32),nan=0.0,posinf=0.0,neginf=0.0)
+            samples.append(arr); offsets.extend(target_idx[lo:hi].tolist())
+        start=end
+    if not samples: raise RuntimeError(f"No sampled rows from {path}")
+    return np.vstack(samples).astype(np.float32),np.asarray(offsets,dtype=np.int64),int(total_rows)
+
+def _split_capture_sequence(X,row_indices,source_file):
+    n=len(X); c1=int(.10*n); c2=int(.70*n); c3=int(.85*n); gap=CAPTURE_EMBARGO_SAMPLED_ROWS
+    ranges={"cal":(0,max(0,c1-gap)),
+            "train":(min(n,c1+gap),max(c1+gap,c2-gap)),
+            "val":(min(n,c2+gap),max(c2+gap,c3-gap)),
+            "test":(min(n,c3+gap),n)}
+    out={}
+    for split,(a,b) in ranges.items():
+        a=min(max(0,a),n); b=min(max(a,b),n)
+        out[split]={"X":X[a:b],"row_indices":row_indices[a:b],
+                    "ids":[f"{source_file}#{int(v)}" for v in row_indices[a:b]]}
+    return out
+
+def _cat_capture_parts(parts,label):
+    if not parts: return np.empty((0,115),dtype=np.float32),np.empty(0,dtype=np.int64),[]
+    X=np.vstack([p["X"] for p in parts]).astype(np.float32)
+    y=np.full(len(X),label,dtype=np.int64)
+    ids=sum([p["ids"] for p in parts],[])
+    return X,y,ids
+
+def _balance_training(X,y,ids,seed):
+    i0=np.flatnonzero(y==0); i1=np.flatnonzero(y==1); n=min(len(i0),len(i1))
+    if n<100: raise RuntimeError(f"Insufficient train classes: benign={len(i0)}, attack={len(i1)}")
+    rng=np.random.default_rng(seed)
+    take=np.concatenate([np.sort(rng.choice(i0,n,replace=False)),np.sort(rng.choice(i1,n,replace=False))])
+    rng.shuffle(take)
+    return X[take],y[take],[ids[i] for i in take]
 
 def load_sampled_clients():
-    listing = get_dataset_listing()
-    by_device = {}
-    source_manifest = []
-    for item in listing:
-        parsed = parse_name(item["name"])
-        if not parsed: continue
-        device, _, capture = parsed
-        by_device.setdefault(device, []).append((item, capture))
-    expected = 9
-    if len(by_device) != expected:
-        raise RuntimeError(f"Expected 9 device clients, found {len(by_device)}: {sorted(by_device)}")
-    clients = {}
-    audit = []
-    for di, device in enumerate(sorted(by_device)):
-        benign_parts, attack_parts = [], []
-        used = []
-        for item, capture in sorted(by_device[device], key=lambda z: z[0]["name"]):
-            # The mirror has one benign capture and multiple attack captures per device.
-            arr, label = read_capture(item, seed=7000 + di * 113 + len(used))
-            used.append(item["name"])
-            source_manifest.append({"device": device, "file": item["name"], "git_blob_sha": item.get("sha"),
-                "bytes": item.get("size"), "label": int(label), "rows_after_capture_cap": int(len(arr))})
-            if label == 0: benign_parts.append(arr)
-            else: attack_parts.append(arr)
-        if not benign_parts or not attack_parts:
-            raise RuntimeError(f"Client {device} lacks one of the two labels")
-        benign = np.concatenate(benign_parts, axis=0)
-        attack = np.concatenate(attack_parts, axis=0)
-        rng = np.random.default_rng(15000 + di)
-        n0 = min(ROWS_PER_CLASS_CLIENT, len(benign))
-        n1 = min(ROWS_PER_CLASS_CLIENT, len(attack))
-        if n0 < 500 or n1 < 500:
-            raise RuntimeError(f"Not enough examples for {device}: benign={n0}, attack={n1}")
-        benign = benign[np.sort(rng.choice(len(benign), size=n0, replace=False))]
-        attack = attack[np.sort(rng.choice(len(attack), size=n1, replace=False))]
-        X = np.vstack([benign, attack]).astype(np.float32)
-        y = np.concatenate([np.zeros(n0, dtype=np.int64), np.ones(n1, dtype=np.int64)])
-        perm = rng.permutation(len(y)); X, y = X[perm], y[perm]
-        # A disjoint 10% calibration slice is reserved for local scaling and MI selection.
-        X_dev, X_cal, y_dev, y_cal = train_test_split(X, y, test_size=0.10, random_state=900+di,
-                                                        stratify=y)
-        # Keep 15% test and 15% validation, leaving 60% train.
-        X_rem, X_test, y_rem, y_test = train_test_split(X_dev, y_dev, test_size=1/6,
-                                                        random_state=1000+di, stratify=y_dev)
-        X_train, X_val, y_train, y_val = train_test_split(X_rem, y_rem, test_size=0.20,
-                                                        random_state=1100+di, stratify=y_rem)
-        scaler = StandardScaler().fit(X_cal)
-        X_cal_s = np.nan_to_num(scaler.transform(X_cal), nan=0.0, posinf=0.0, neginf=0.0)
-        scores = mutual_info_classif(X_cal_s, y_cal, random_state=di, n_neighbors=3)
-        selected = np.argsort(scores)[-TOP_K:]
-        mask = np.zeros(X.shape[1], dtype=np.float32); mask[selected] = 1.0
+    csv_files,archive_sha=prepare_official_dataset()
+    capture_rows=[]; capture_manifest=[]; raw_records_total=0
+    for fi,path in enumerate(csv_files):
+        device=_device_name(path); label=0 if "benign_traffic" in path.name.lower() else 1
+        cap=BENIGN_CAPTURE_CAP if label==0 else ATTACK_CAPTURE_CAP
+        rel=str(path.relative_to(RAW_ROOT)).replace("\\\\","/")
+        X,row_idx,total_rows=_systematic_capture_sample(path,cap)
+        raw_records_total+=total_rows
+        pieces=_split_capture_sequence(X,row_idx,rel)
+        row={"device":device,"source_file":rel,"label":label,"rows_in_source":total_rows,
+             "file_bytes":int(path.stat().st_size),"sampled_rows":int(len(row_idx)),
+             "cal_rows":len(pieces["cal"]["ids"]),"train_rows":len(pieces["train"]["ids"]),
+             "validation_rows":len(pieces["val"]["ids"]),"test_rows":len(pieces["test"]["ids"]),
+             "purged_sampled_rows":int(len(row_idx)-sum(len(pieces[k]["ids"]) for k in pieces)),
+             "split_policy":"chronological 10/60/15/15 blocks; 5 sampled-row embargo"}
+        capture_manifest.append({"device":device,"file":rel,"label":label,"rows_in_official_capture":total_rows,
+            "sampled_rows":len(row_idx),"file_bytes":int(path.stat().st_size),
+            "sampling":"systematic, temporal order preserved"})
+        capture_rows.append((device,label,pieces,row))
+        print(f"Audited {device}/{path.name}: raw_rows={total_rows:,}, sampled={len(row_idx):,}, label={label}")
+    if set(r[0] for r in capture_rows)!=set(DEVICE_NAMES):
+        raise RuntimeError(f"Official archive did not yield expected nine devices: {sorted(set(r[0] for r in capture_rows))}")
+    clients={}; client_audit=[]; capture_audit=[]; overlap_audit=[]
+    for di,device in enumerate(DEVICE_NAMES):
+        by_split={s:{0:[],1:[]} for s in ["cal","train","val","test"]}
+        files=[]
+        for dname,label,pieces,row in capture_rows:
+            if dname!=device: continue
+            files.append(row["source_file"]); capture_audit.append(row)
+            for split in by_split:
+                by_split[split][label].append(pieces[split])
+        merged={}
+        for split in ["cal","train","val","test"]:
+            X0,y0,ids0=_cat_capture_parts(by_split[split][0],0)
+            X1,y1,ids1=_cat_capture_parts(by_split[split][1],1)
+            X=np.vstack([X0,X1]).astype(np.float32); y=np.concatenate([y0,y1]); ids=ids0+ids1
+            if split=="train": X,y,ids=_balance_training(X,y,ids,24000+di)
+            merged[split]={"X":X,"y":y,"ids":ids}
+        idsets={s:set(merged[s]["ids"]) for s in merged}
+        for a,b in [("cal","train"),("cal","val"),("cal","test"),("train","val"),("train","test"),("val","test")]:
+            ov=idsets[a].intersection(idsets[b])
+            overlap_audit.append({"device":device,"split_a":a,"split_b":b,"overlap_rows":len(ov)})
+            if ov: raise RuntimeError(f"Source-row identity leakage for {device}: {a}/{b}: {len(ov)} rows")
+        # Fit scaling/MI only on the explicit calibration partition; it is outside the DP-protected train partition.
+        Xcal,ycal=merged["cal"]["X"],merged["cal"]["y"]
+        scaler=StandardScaler().fit(Xcal)
+        Xcal_s=np.nan_to_num(scaler.transform(Xcal),nan=0.0,posinf=0.0,neginf=0.0)
+        scores=mutual_info_classif(Xcal_s,ycal,random_state=di,n_neighbors=3)
+        mask=np.zeros(115,dtype=np.float32); mask[np.argsort(scores)[-TOP_K:]]=1.0
         def transform(a):
-            z = scaler.transform(a)
-            z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
-            z = np.clip(z, -10.0, 10.0).astype(np.float32)
-            return z
-        clients[device] = {
-            "X_train": transform(X_train), "y_train": y_train.astype(np.int64),
-            "X_val": transform(X_val), "y_val": y_val.astype(np.int64),
-            "X_test": transform(X_test), "y_test": y_test.astype(np.int64),
-            "X_cal": transform(X_cal), "y_cal": y_cal.astype(np.int64),
-            "mask": mask, "files": used, "n0": int(n0), "n1": int(n1),
-            "train_n": int(len(y_train)), "val_n": int(len(y_val)), "test_n": int(len(y_test)),
-            "features_selected": int(mask.sum())
+            z=scaler.transform(a)
+            return np.clip(np.nan_to_num(z,nan=0.0,posinf=0.0,neginf=0.0),-10.0,10.0).astype(np.float32)
+        rng=np.random.default_rng(25000+di); perm=rng.permutation(len(merged["train"]["y"]))
+        Xtrain=merged["train"]["X"][perm]; ytrain=merged["train"]["y"][perm]
+        clients[device]={
+            "X_train":transform(Xtrain),"y_train":ytrain,
+            "X_val":transform(merged["val"]["X"]),"y_val":merged["val"]["y"],
+            "X_test":transform(merged["test"]["X"]),"y_test":merged["test"]["y"],
+            "X_cal":transform(Xcal),"y_cal":ycal,"mask":mask,"files":files,
+            "train_n":int(len(ytrain)),"val_n":int(len(merged["val"]["y"])),
+            "test_n":int(len(merged["test"]["y"])),"features_selected":int(mask.sum()),
+            "_dataset_cache":{}
         }
-        audit.append({"client": device, "source_files": len(used), "benign_selected": n0,
-            "attack_selected": n1, "calibration_rows": len(y_cal), "train_rows": len(y_train),
-            "validation_rows": len(y_val), "test_rows": len(y_test),
-            "features_selected": int(mask.sum()), "train_benign": int((y_train==0).sum()),
-            "train_attack": int((y_train==1).sum()), "test_benign": int((y_test==0).sum()),
-            "test_attack": int((y_test==1).sum())})
-        print(f"Loaded {device}: n={len(y)} train={len(y_train)} val={len(y_val)} test={len(y_test)}")
-    pd.DataFrame(source_manifest).to_csv(ROOT / "source_file_manifest.csv", index=False)
-    pd.DataFrame(audit).to_csv(ROOT / "client_data_audit.csv", index=False)
-    (ROOT / "data_provenance.json").write_text(json.dumps({
-        "dataset":"N-BaIoT sample mirror", "repository":f"https://github.com/{REPO}",
-        "pinned_commit":DATA_COMMIT, "data_directory":"data/dataset20000",
-        "device_clients":sorted(clients), "feature_count":115,
-        "sampling":{"benign_rows_per_device":ROWS_PER_CLASS_CLIENT,
-            "attack_rows_per_device":ROWS_PER_CLASS_CLIENT,
-            "max_rows_per_attack_capture_before_within_device_sampling":MAX_PER_ATTACK_CAPTURE},
-        "label_mapping":{"benign":0,"all_attack_captures":1},
-        "split":{"calibration":0.10,"train":0.60,"validation":0.15,"test":0.15},
-        "note":"This is a pinned, community-prepared sample mirror derived from N-BaIoT, not the complete official UCI archive."
-    }, indent=2), encoding="utf-8")
+        n0=int((ytrain==0).sum()); n1=int((ytrain==1).sum())
+        client_audit.append({
+            "client":device,"source_files":len(files),
+            "benign_selected":int(sum(len(pieces[s]["ids"]) for dname,label,pieces,_ in capture_rows if dname==device and label==0 for s in ["cal","train","val","test"])),
+            "attack_selected":int(sum(len(pieces[s]["ids"]) for dname,label,pieces,_ in capture_rows if dname==device and label==1 for s in ["cal","train","val","test"])),
+            "calibration_rows":len(ycal),"train_rows":len(ytrain),"validation_rows":len(merged["val"]["y"]),
+            "test_rows":len(merged["test"]["y"]),"features_selected":int(mask.sum()),
+            "train_benign":n0,"train_attack":n1,
+            "test_benign":int((merged["test"]["y"]==0).sum()),"test_attack":int((merged["test"]["y"]==1).sum()),
+            "train_balance":"balanced by deterministic downsampling",
+            "test_policy":"all non-purged held-out sequence-block rows retained"
+        })
+        print(f"Loaded {device}: train={len(ytrain)} val={len(merged['val']['y'])} test={len(merged['test']['y'])}, train class counts {n0}/{n1}")
+    pd.DataFrame(capture_manifest).to_csv(ROOT/"source_file_manifest.csv",index=False)
+    pd.DataFrame(capture_audit).to_csv(ROOT/"capture_split_audit.csv",index=False)
+    pd.DataFrame(overlap_audit).to_csv(ROOT/"split_leakage_audit.csv",index=False)
+    pd.DataFrame(client_audit).to_csv(ROOT/"client_data_audit.csv",index=False)
+    (ROOT/"data_provenance.json").write_text(json.dumps({
+        "dataset":"Official UCI N-BaIoT archive","dataset_page":DATASET_PAGE,"dataset_doi":DATASET_DOI,
+        "download_url":OFFICIAL_DATA_URL,"archive_sha256":archive_sha,"source_capture_files":len(capture_manifest),
+        "raw_records_counted_across_csv_files":int(raw_records_total),"device_clients":DEVICE_NAMES,"feature_count":115,
+        "sampling":{"benign_capture_cap":BENIGN_CAPTURE_CAP,"attack_cap_per_capture":ATTACK_CAPTURE_CAP,
+            "method":"systematic, ordered sample from each original CSV capture; original row identities preserved",
+            "training_balance":"per-client training downsampled to equal benign/attack counts"},
+        "labels":{"benign_traffic.csv":0,"all attack CSV captures":1},
+        "split":{"calibration_fraction":0.10,"train_fraction":0.60,"validation_fraction":0.15,"test_fraction":0.15,
+            "method":"chronological blocks per capture with 5 sampled-row embargo at partition boundaries",
+            "row_identity_overlap":"pairwise source-path + original-row-ID audit; all intersections must be zero"},
+        "privacy_scope":"Record-level DP covers only client-local training-partition records. Public calibration rows used for scaling and MI are excluded from the protected set; the statement is conditional on this preprocessing.",
+        "limit":"The full official archive is downloaded and audited, but model training uses a bounded deterministic sample from all available original captures; this is not an all-7,062,606-record training run."
+    },indent=2),encoding="utf-8")
     return clients
 
 class Detector(nn.Module):
@@ -275,12 +377,18 @@ def aggregate_deltas(deltas, aggregator, f=1):
     return agg, selected
 
 def train_local_update(global_model, client, config, seed, privacy_engine=None,
-                       flip_labels=False):
-    seed_all(seed)
-    X,y=batch_xy(client,"train",config["mi"])
-    y=y.copy()
-    if flip_labels: y=1-y
-    ds=TensorDataset(torch.as_tensor(X,dtype=torch.float32),torch.as_tensor(y,dtype=torch.long))
+                       flip_labels=False, noise_generator=None):
+    random.seed(seed); np.random.seed(seed)
+    if not config["dp"]: torch.manual_seed(seed)
+    key=(bool(config["mi"]),bool(flip_labels))
+    cache=client.setdefault("_dataset_cache",{})
+    if key not in cache:
+        X=client["X_train"]
+        if config["mi"]: X=X*client["mask"][None,:]
+        y=client["y_train"].copy()
+        if flip_labels: y=1-y
+        cache[key]=TensorDataset(torch.as_tensor(X,dtype=torch.float32),torch.as_tensor(y,dtype=torch.long))
+    ds=cache[key]
     loader=DataLoader(ds,batch_size=BATCH_SIZE,shuffle=True,
         generator=torch.Generator().manual_seed(seed),drop_last=False)
     model=Detector().to(DEVICE)
@@ -288,10 +396,13 @@ def train_local_update(global_model, client, config, seed, privacy_engine=None,
     model.load_state_dict(base)
     teacher=deepcopy(global_model).to(DEVICE).eval() if config["kd"] else None
     opt=torch.optim.SGD(model.parameters(),lr=LR)
+    exact_q=None; steps_this_round=0
     if config["dp"]:
         model,opt,loader=privacy_engine.make_private(
             module=model,optimizer=opt,data_loader=loader,
-            noise_multiplier=config["sigma"],max_grad_norm=CLIP_NORM,poisson_sampling=True)
+            noise_multiplier=config["sigma"],max_grad_norm=CLIP_NORM,poisson_sampling=True,
+            noise_generator=noise_generator)
+        exact_q=float(getattr(loader,"sample_rate",1.0/len(loader)))
     model.train()
     for _ in range(LOCAL_EPOCHS):
         for xb,yb in loader:
@@ -307,6 +418,7 @@ def train_local_update(global_model, client, config, seed, privacy_engine=None,
                 loss_each=loss_each+0.25*kd
             loss=loss_each.mean()
             loss.backward(); opt.step()
+            if config["dp"]: steps_this_round+=1
             if config["prox"]:
                 with torch.no_grad():
                     core=core_model(model)
@@ -316,7 +428,7 @@ def train_local_update(global_model, client, config, seed, privacy_engine=None,
     delta={k:final[k]-base[k] for k in base}
     del model,teacher,opt,loader
     if torch.cuda.is_available(): torch.cuda.empty_cache()
-    return delta
+    return delta,steps_this_round,exact_q
 
 def run_federated(clients, config, seed, scenario="clean", capture_preds=False):
     seed_all(seed)
@@ -324,15 +436,22 @@ def run_federated(clients, config, seed, scenario="clean", capture_preds=False):
     global_model.eval()
     client_names=list(clients)
     privacy_engines={name:PrivacyEngine(accountant="rdp") for name in client_names} if config["dp"] else {}
+    noise_generators={name:torch.Generator(device=DEVICE).manual_seed(secrets.randbits(63))
+                      for name in client_names} if config["dp"] else {}
     attacker=client_names[(seed*2+2)%len(client_names)]
     per_round=[]; selection_rows=[]; privacy_rows=[]
     malicious_start=2
+    dp_steps_cumulative={name:0 for name in client_names}; dp_q_by_client={name:None for name in client_names}
     for rnd in range(ROUNDS):
-        deltas={}
+        deltas={}; steps_by_client={}; q_by_client={}
         for name in client_names:
             attack_active=(scenario!="clean" and rnd>=malicious_start and name==attacker)
-            delta=train_local_update(global_model,clients[name],config,seed*100000+rnd*100+client_names.index(name),
-                privacy_engine=privacy_engines.get(name),flip_labels=(scenario=="label_flip" and attack_active))
+            delta,steps_this_round,q_actual=train_local_update(global_model,clients[name],config,seed*100000+rnd*100+client_names.index(name),
+                privacy_engine=privacy_engines.get(name),flip_labels=(scenario=="label_flip" and attack_active),
+                noise_generator=noise_generators.get(name))
+            if config["dp"]:
+                dp_steps_cumulative[name]+=steps_this_round; dp_q_by_client[name]=q_actual
+                steps_by_client[name]=steps_this_round; q_by_client[name]=q_actual
             if scenario=="sign_flip" and attack_active:
                 delta={k:(-2.0*v) for k,v in delta.items()}
             deltas[name]=delta
@@ -348,9 +467,11 @@ def run_federated(clients, config, seed, scenario="clean", capture_preds=False):
             if config["dp"]:
                 eps=float(privacy_engines[name].get_epsilon(delta=DELTA_DP))
                 privacy_rows.append({"seed":seed,"model":config["name"],"scenario":scenario,"round":rnd+1,
-                    "client":name,"epsilon":eps,"delta":DELTA_DP,"noise_multiplier":config["sigma"],
+                    "client":name,"epsilon_opacus":eps,"epsilon":eps,"delta":DELTA_DP,"noise_multiplier":config["sigma"],
                     "max_grad_norm":CLIP_NORM,"train_records":clients[name]["train_n"],
-                    "sample_rate_approx":min(1.0,BATCH_SIZE/max(1,clients[name]["train_n"]))})
+                    "sample_rate_actual":dp_q_by_client[name],"steps_this_round":steps_by_client[name],
+                    "cumulative_dp_steps":dp_steps_cumulative[name],"accountant":"Opacus RDPAccountant",
+                    "noise_rng":"independent high-entropy-seeded per-client torch.Generator"})
         metrics,_,_=pooled_evaluate(global_model,clients,config["mi"],split="val")
         per_round.append({"seed":seed,"model":config["name"],"scenario":scenario,"round":rnd+1,**metrics,
             "selected_clients":";".join(selected),"rejected_clients":";".join(rejected),
@@ -465,7 +586,7 @@ def make_figures(metrics_df, rounds_df, privacy_df, selection_df, clients, full_
 def main():
     t0=time.time()
     print("Python",sys.version); print("Torch",torch.__version__); print("Opacus",__import__("opacus").__version__)
-    print("Pinned source",REPO,DATA_COMMIT)
+    print("Official dataset source",DATASET_PAGE,"DOI",DATASET_DOI)
     clients=load_sampled_clients()
     device_names=list(clients)
     configs=make_configs()
@@ -544,8 +665,33 @@ def main():
                 "honest_rejection_rate":float((honest.selected==0).mean()) if len(honest) else np.nan,
                 "malicious_selection_rate":float(g.loc[g.is_malicious==1,"selected"].mean()) if (g.is_malicious==1).any() else np.nan})
         pd.DataFrame(s).to_csv(ROOT/"selection_diagnostics.csv",index=False)
-    # Privacy summary is accountant-derived across all private training rounds.
+    # Independent second implementation of the sampled-Gaussian RDP accountant.
     if len(privacy_df):
+        from dp_accounting import dp_event, rdp
+        independent_rows=[]
+        for (seed_i,model_i,scenario_i,client_i),g in privacy_df.groupby(["seed","model","scenario","client"]):
+            for _,rr in g.sort_values("round").iterrows():
+                q=float(rr["sample_rate_actual"]); sigma=float(rr["noise_multiplier"])
+                steps=int(rr["cumulative_dp_steps"]); delta=float(rr["delta"])
+                acc=rdp.RdpAccountant()
+                if steps>0:
+                    acc.compose(dp_event.PoissonSampledDpEvent(q,dp_event.GaussianDpEvent(sigma)),count=steps)
+                    eps_ind=float(acc.get_epsilon(delta=delta))
+                else: eps_ind=0.0
+                independent_rows.append({"seed":int(seed_i),"model":model_i,"scenario":scenario_i,"client":client_i,
+                    "round":int(rr["round"]),"sample_rate_actual":q,"noise_multiplier":sigma,
+                    "cumulative_dp_steps":steps,"epsilon_opacus":float(rr["epsilon_opacus"]),
+                    "epsilon_dp_accounting":eps_ind,"absolute_difference":abs(float(rr["epsilon_opacus"])-eps_ind),
+                    "delta":delta})
+        independent_df=pd.DataFrame(independent_rows)
+        independent_df.to_csv(ROOT/"privacy_independent_audit.csv",index=False)
+        max_error=float(independent_df["absolute_difference"].max()) if len(independent_df) else 0.0
+        audit_status="PASS" if max_error<=0.5 else "REVIEW_REQUIRED"
+        (ROOT/"privacy_independent_audit_status.txt").write_text(
+            f"{audit_status}\nmax_absolute_epsilon_difference={max_error:.6f}\n"
+            "Opacus and Google dp-accounting evaluated the same recorded Poisson sample rate, noise multiplier, "
+            "cumulative optimizer-step count and delta. Inspect the per-client/per-round CSV; finite RDP order grids can differ.\n",
+            encoding="utf-8")
         privacy_df.groupby(["model","scenario","seed"]).agg(
             max_epsilon=("epsilon","max"),mean_epsilon=("epsilon","mean"),max_round=("round","max"),
             clients=("client","nunique"),delta=("delta","max")).reset_index().to_csv(ROOT/"privacy_summary.csv",index=False)
@@ -555,7 +701,7 @@ def main():
         "run_id":time.strftime("%Y%m%dT%H%M%SZ",time.gmtime()),"python":sys.version,"platform":platform.platform(),
         "torch":torch.__version__,"opacus":__import__("opacus").__version__,"numpy":np.__version__,
         "pandas":pd.__version__,"sklearn":__import__("sklearn").__version__,"device":"CPU",
-        "data_source_repository":f"https://github.com/{REPO}","data_commit":DATA_COMMIT,
+        "data_source_repository":DATASET_PAGE,"data_doi":DATASET_DOI,"official_archive_url":OFFICIAL_DATA_URL,
         "clients":device_names,"feature_count":115,"seeds":SEEDS,"rounds":ROUNDS,"local_epochs":LOCAL_EPOCHS,
         "batch_size":BATCH_SIZE,"learning_rate":LR,"mi_top_k":TOP_K,"dp_noise_multipliers":NOISES,
         "clip_norm":CLIP_NORM,"delta":DELTA_DP,"multi_krum_f":1,"multi_krum_selected_n":6,
@@ -566,10 +712,9 @@ def main():
     (ROOT/"run_config.json").write_text(json.dumps(runtime,indent=2),encoding="utf-8")
     (ROOT/"RUN_STATUS.txt").write_text(
         "COMPLETED: all configured experiment loops and exports reached the end of main().\n"
-        "Review raw run_metrics.csv, summary_metrics.csv, privacy_accounting.csv, per_device_metrics.csv, "
-        "client_selection.csv, selection_diagnostics.csv, source_file_manifest.csv, data_provenance.json, "
-        "run_config.json and figures before use in a manuscript.\n"
-        "These are experiments on a pinned community-prepared N-BaIoT sample mirror, not the complete UCI archive.\n",
+        "The official UCI N-BaIoT archive was downloaded, SHA-256 hashed, and its raw capture CSVs audited.\n"
+        "Training used deterministic temporal samples from the official captures; it is not an all-7,062,606-record training run.\n"
+        "Review run_metrics.csv, summary_metrics.csv, privacy_accounting.csv, privacy_independent_audit.csv, split_leakage_audit.csv, capture_split_audit.csv, per_device_metrics.csv, source_file_manifest.csv, data_provenance.json, run_config.json and figures.\n",
         encoding="utf-8")
     print("\nEXPERIMENT COMPLETE")
     print(summary[["scenario","model","runs","macro_f1_mean","macro_f1_std","max_client_epsilon_mean"]].to_string(index=False))
