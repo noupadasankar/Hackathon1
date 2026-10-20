@@ -67,7 +67,7 @@ def get_dataset_listing():
 def read_capture(item, seed):
     path = CACHE / item["name"]
     if not path.exists() or path.stat().st_size != int(item.get("size", -1)):
-        url = item.get("download_url") or f"https://raw.githubusercontent.com/{REPO}/{DATA_COMMIT}/{item['path']}"
+        url = f"https://raw.githubusercontent.com/{REPO}/{DATA_COMMIT}/{item['path']}"
         r = requests.get(url, timeout=120)
         r.raise_for_status()
         content = r.content
