@@ -1,0 +1,31 @@
+name: Export anonymous PrivFD-IDS experiment source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "run_privfd_sample.py"
+
+permissions:
+  contents: read
+
+jobs:
+  export-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout run commit and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Export source from the validated official-data run commit
+        run: |
+          mkdir -p source_bundle
+          git show 48abc9cdd6f1ec8e8ed58afbe27ca0bf0179665a:run_privfd_sample.py > source_bundle/run_privfd_sample.py
+          printf 'Validated run commit: 48abc9cdd6f1ec8e8ed58afbe27ca0bf0179665a\n' > source_bundle/SOURCE_COMMIT.txt
+          sha256sum source_bundle/run_privfd_sample.py > source_bundle/SOURCE_SHA256.txt
+      - name: Upload exact experiment runner
+        uses: actions/upload-artifact@v4
+        with:
+          name: privfd-ids-anonymous-runner-source
+          path: source_bundle/
+          retention-days: 14
