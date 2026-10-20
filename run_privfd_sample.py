@@ -225,11 +225,11 @@ def pred_prob(model, X, mi=False, mask=None, batch_size=4096):
         out.extend(torch.softmax(model(xt),dim=1)[:,1].cpu().numpy().tolist())
     return np.asarray(out)
 
-def pooled_evaluate(model, clients, mi):
+def pooled_evaluate(model, clients, mi, split="test"):
     ys=[]; ps=[]; per=[]
     device_outputs={}
     for name,c in clients.items():
-        X,y=batch_xy(c,"test",mi)
+        X,y=batch_xy(c,split,mi)
         p=pred_prob(model,X,False)
         met=evaluate_probs(y,p)
         per.append({"client":name,**met})
@@ -351,7 +351,7 @@ def run_federated(clients, config, seed, scenario="clean", capture_preds=False):
                     "client":name,"epsilon":eps,"delta":DELTA_DP,"noise_multiplier":config["sigma"],
                     "max_grad_norm":CLIP_NORM,"train_records":clients[name]["train_n"],
                     "sample_rate_approx":min(1.0,BATCH_SIZE/max(1,clients[name]["train_n"]))})
-        metrics,_,_=pooled_evaluate(global_model,clients,config["mi"])
+        metrics,_,_=pooled_evaluate(global_model,clients,config["mi"],split="val")
         per_round.append({"seed":seed,"model":config["name"],"scenario":scenario,"round":rnd+1,**metrics,
             "selected_clients":";".join(selected),"rejected_clients":";".join(rejected),
             "malicious_client":attacker if scenario!="clean" else ""})
@@ -459,7 +459,7 @@ def make_figures(metrics_df, rounds_df, privacy_df, selection_df, clients, full_
     for m in show:
         g=conv[conv.model==m]
         if len(g): ax.plot(g["round"],g["macro_f1"],marker="o",label=m)
-    ax.set_xlabel("Communication round"); ax.set_ylabel("Macro-F1"); ax.set_ylim(0,1); ax.set_title("Federated convergence on held-out test clients"); ax.legend(fontsize=8)
+    ax.set_xlabel("Communication round"); ax.set_ylabel("Validation macro-F1"); ax.set_ylim(0,1); ax.set_title("Federated convergence on validation clients"); ax.legend(fontsize=8)
     fig.tight_layout(); fig.savefig(FIG/"07_validation_convergence.png",dpi=220); plt.close(fig)
 
 def main():
